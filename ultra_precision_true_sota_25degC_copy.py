@@ -1,4 +1,6 @@
-﻿"""
+﻿
+
+"""
 25°C真正SOTA训练脚本 - 保持UDDS优势，大幅提升NN
 正确的优化思路：不是平衡，而是双重提升
 
@@ -22,6 +24,7 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback, LearningRateMonitor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
+from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from scipy.signal import savgol_filter
@@ -29,8 +32,6 @@ from scipy.signal import savgol_filter
 # 使用新的电化学特征工程
 from electrochemical_features import ElectrochemicalFeatureEngineer, create_electrochemical_dataset
 from model_code_lightning import setup_chinese_font
-# from electrochemical_46features_datamodule import Electrochemical46FeaturesDataModule # 移除旧的导入
-from electrochemical_46features_datamodule import Electrochemical46FeaturesDataModule # 导入新的StandardScaler数据模块
 
 setup_chinese_font()
 
@@ -90,14 +91,13 @@ class TrueSOTAElectrochemicalKANTransformer(nn.Module):
     
     def __init__(self, input_dim, num_heads, num_layers, num_outputs, 
                  hidden_space, dropout_rate, embed_dim, grid_size=16,
-                 temperature=None, feature_scaler=None, detector_temp_init=0.7):
+                 temperature=None, feature_scaler=None):
         super().__init__()
         
         self.input_dim = input_dim
         self.num_outputs = num_outputs
         self.temperature = temperature
-        self.feature_scaler = feature_scaler # 存储标准化器
-        self.detector_temperature = nn.Parameter(torch.tensor(detector_temp_init)) # workload detector softmax temperature
+        self.feature_scaler = feature_scaler # 存储特征标准化器
         
         # === [策略1] 保持成功的特征编码器 ===
         # 基于UDDS成功经验的特征分组编码
@@ -153,36 +153,31 @@ class TrueSOTAElectrochemicalKANTransformer(nn.Module):
         )
         
         # === [策略2] 工况检测器 ===
-        base_encoded_dim = hidden_space//4 * 3 + hidden_space//6 * 2
-        # 新增：1D注意力池化层
-        self.attention_pooling = nn.Sequential(
-            nn.Linear(base_encoded_dim, 1),
-            nn.Softmax(dim=1) # 在时间维度上进行Softmax
-        )
-        detector_input_dim = base_encoded_dim # 注意力池化后维度与编码维度相同
+        total_encoded_dim = hidden_space//4 * 3 + hidden_space//6 * 2
         self.workload_detector = nn.Sequential(
-            nn.Linear(detector_input_dim, hidden_space//2),
+            nn.Linear(total_encoded_dim, hidden_space//2),
             nn.LayerNorm(hidden_space//2),
             nn.ReLU(),
             nn.Dropout(dropout_rate * 0.1),
             nn.Linear(hidden_space//2, hidden_space//4),
             nn.ReLU(),
-            nn.Linear(hidden_space//4, 2)  # NN vs UDDS，Softmaxƶforward¶
+            nn.Linear(hidden_space//4, 2),  # NN vs UDDS
+            nn.Softmax(dim=-1)
         )
         
         # === [策略3] 工况特定的处理分支 ===
         
         # UDDS分支 (保持简单有效的设计)
         self.udds_branch = nn.Sequential(
-            nn.Linear(base_encoded_dim, hidden_space),
+            nn.Linear(total_encoded_dim, hidden_space),
             nn.LayerNorm(hidden_space),
             nn.GELU(),
-            nn.Dropout(dropout_rate * 0.10)
+            nn.Dropout(dropout_rate * 0.15)
         )
         
         # NN分支 (专门针对NN的复杂设计)
         self.nn_branch = nn.Sequential(
-            nn.Linear(base_encoded_dim, hidden_space + 32),  # 更大容量
+            nn.Linear(total_encoded_dim, hidden_space + 32),  # 更大容量
             nn.LayerNorm(hidden_space + 32),
             nn.GELU(),
             nn.Dropout(dropout_rate * 0.1),  # 更低dropout
@@ -257,11 +252,7 @@ class TrueSOTAElectrochemicalKANTransformer(nn.Module):
         )
         
         # === 电化学物理约束层 ===
-        self.electrochemical_constraint = TrueSOTAConstraintLayer(num_outputs, temperature, feature_scaler=feature_scaler)
-        
-        # 新增：可学习的融合权重参数
-        self.fusion_weight_param = nn.Parameter(torch.tensor(0.5)) # 初始值0.5，表示平均融合
-        self.fusion_weight_head_param = nn.Parameter(torch.tensor(0.5)) # ͷ���������ʵȨ��
+        self.electrochemical_constraint = TrueSOTAConstraintLayer(num_outputs, temperature)
         
     def forward(self, x, return_uncertainty=False):
         batch_size, seq_len, features = x.shape
@@ -279,15 +270,10 @@ class TrueSOTAElectrochemicalKANTransformer(nn.Module):
             impedance_encoded, temp_encoded
         ], dim=-1)
         
-        # === 工况检测 - 使用1D注意力池化 ===
-        attention_weights = self.attention_pooling(concatenated_features) # [batch, seq_len, 1]
-        detector_input = torch.sum(concatenated_features * attention_weights, dim=1) # [batch, base_encoded_dim]
-        detector_logits = self.workload_detector(detector_input)
-        temp = torch.clamp(self.detector_temperature, min=0.2, max=5.0)
-        workload_probs = F.softmax(detector_logits / temp, dim=-1)  # [batch, 2]
+        # === 工况检测 ===
+        workload_probs = self.workload_detector(concatenated_features.mean(dim=1))  # [batch, 2]
         nn_prob = workload_probs[:, 0]      # NN工况概率
         udds_prob = workload_probs[:, 1]    # UDDS工况概率
-        # print(f"DEBUG: workload_probs (NN, UDDS): mean_nn={nn_prob.mean().item():.4f}, mean_udds={udds_prob.mean().item():.4f}, std_nn={nn_prob.std().item():.4f}, std_udds={udds_prob.std().item():.4f}")
         
         # === 工况特定处理 ===
         udds_features = self.udds_branch(concatenated_features)
@@ -312,42 +298,21 @@ class TrueSOTAElectrochemicalKANTransformer(nn.Module):
         weighted_features = nn_enhanced * nn_weight + udds_enhanced * udds_weight
         
         # === 主要Transformer处理 ===
-        # Transformer输出形状: [batch, num_outputs] (因为TimeSeriesTransformer_ekan内部已取最后一个时间步)
         transformer_output = self.main_transformer(weighted_features)
-        # print(f"DEBUG: transformer_output (原始): min={transformer_output.min().item():.4f}, max={transformer_output.max().item():.4f}, mean={transformer_output.mean().item():.4f}, std={transformer_output.std().item():.4f}")
-        # 此时 transformer_output 形状为 [batch, num_outputs]，无需再取[:, -1, :]
         
         # === 工况特定预测 ===
-        # 预测头已经输出 [batch, num_outputs] (现在是logits)
-        nn_pred_logits = self.nn_prediction_head(weighted_features.mean(dim=1))
-        udds_pred_logits = self.udds_prediction_head(weighted_features.mean(dim=1))
-        # print(f"DEBUG: nn_pred_logits: min={nn_pred_logits.min().item():.4f}, max={nn_pred_logits.max().item():.4f}, mean={nn_pred_logits.mean().item():.4f}, std={nn_pred_logits.std().item():.4f}")
-        # print(f"DEBUG: udds_pred_logits: min={udds_pred_logits.min().item():.4f}, max={udds_pred_logits.max().item():.4f}, mean={udds_pred_logits.mean().item():.4f}, std={udds_pred_logits.std().item():.4f}")
-
-        # 加权预测 (直接使用 logits 融合)
-        # nn_weight 和 udds_weight 形状为 [batch, 1, 1]，需要调整为 [batch, 1]
-        final_prediction_weighted_logits = (nn_pred_logits * nn_weight.squeeze(1) + 
-                                           udds_pred_logits * udds_weight.squeeze(1))
-        # print(f"DEBUG: final_prediction_weighted_logits: min={final_prediction_weighted_logits.min().item():.4f}, max={final_prediction_weighted_logits.max().item():.4f}, mean={final_prediction_weighted_logits.mean().item():.4f}, std={final_prediction_weighted_logits.std().item():.4f}")
-
-        # 动态融合transformer输出和特定预测
-        raw_w_t = torch.sigmoid(self.fusion_weight_param)
-        raw_w_h = torch.sigmoid(self.fusion_weight_head_param)
-        norm = raw_w_t + raw_w_h + 1e-6
-        fusion_weight_transformer = raw_w_t / norm
-        fusion_weight_head = raw_w_h / norm
+        nn_pred = self.nn_prediction_head(weighted_features.mean(dim=1))
+        udds_pred = self.udds_prediction_head(weighted_features.mean(dim=1))
         
-        combined_output_last_step_logits = fusion_weight_transformer * transformer_output + fusion_weight_head * final_prediction_weighted_logits
-        # print(f"DEBUG: combined_output_last_step (融合后 logits): min={combined_output_last_step_logits.min().item():.4f}, max={combined_output_last_step_logits.max().item():.4f}, mean={combined_output_last_step_logits.mean().item():.4f}, std={combined_output_last_step_logits.std().item():.4f}")
+        # 加权预测
+        final_prediction = (nn_pred * nn_weight.squeeze(1).squeeze(1).unsqueeze(1) + 
+                          udds_pred * udds_weight.squeeze(1).squeeze(1).unsqueeze(1))
+        
+        # 融合transformer输出和特定预测
+        combined_output = 0.6 * transformer_output + 0.4 * final_prediction.unsqueeze(1)
         
         # === 物理约束 ===
-        # 将 logits 传入物理约束层
-        constrained_output = self.electrochemical_constraint(combined_output_last_step_logits.unsqueeze(1), x[:, -1, :].unsqueeze(1)) # 物理约束层将处理 Sigmoid 激活和 Clamp
-        # print(f"DEBUG: constrained_output (物理约束层输出): min={constrained_output.min().item():.4f}, max={constrained_output.max().item():.4f}, mean={constrained_output.mean().item():.4f}, std={constrained_output.std().item():.4f}")
-        # 因为约束层内部现在期望 [batch, seq_len, num_outputs] 并且已经将其展平处理，
-        # 我们这里输入的是 [batch, 1, num_outputs] 并且 x[:, -1, :].unsqueeze(1) 也是 [batch, 1, num_outputs]
-        # 约束层的输出会是 [batch, 1, num_outputs]，我们需要其最终是 [batch, num_outputs]
-        constrained_output = constrained_output.squeeze(1)
+        constrained_output = self.electrochemical_constraint(combined_output, x)
         
         if return_uncertainty:
             return constrained_output, workload_probs
@@ -358,79 +323,82 @@ class TrueSOTAElectrochemicalKANTransformer(nn.Module):
 class TrueSOTAConstraintLayer(nn.Module):
     """真正SOTA的物理约束层"""
     
-    def __init__(self, num_outputs, temperature=None, feature_scaler=None): # 移除 target_scaler 参数
+    def __init__(self, num_outputs, temperature=None):
         super().__init__()
         self.num_outputs = num_outputs
         self.temperature = temperature
-        self.feature_scaler = feature_scaler # 存储特征标准化器 (用于输入特征)
         
-        # 工况自适应约束强度 (恢复为固定值)
-        self.nn_constraint_strength = 1.0   
-        self.udds_constraint_strength = 1.0  
+        # 工况自适应约束强度
+        self.nn_constraint_strength = nn.Parameter(torch.tensor(0.12))    # NN需要更强约束
+        self.udds_constraint_strength = nn.Parameter(torch.tensor(0.08))  # UDDS约束适中
         
-        self.soc_soe_coupling = 0.6 # 从 0.8 进一步调整为 0.6，继续减弱耦合强度
-        self.electrochemical_weight = 0.055 # 这个参数不在约束层使用，保持不变
+        self.soc_soe_coupling = nn.Parameter(torch.tensor(0.10))
+        self.electrochemical_weight = nn.Parameter(torch.tensor(0.055))
         
         if temperature is not None:
-            self.temp_constraint = 1.0 # 恢复为固定值1.0
+            self.temp_constraint = nn.Parameter(torch.tensor(0.035))
         else:
             self.temp_constraint = None
             
-    def forward(self, predictions, inputs): # predictions 此时应是融合后的 logits
-        # 🚨 [关键修改] 在这里对 predictions 进行 Sigmoid 激活，并确保其在 0-1 范围
-        # 以前在 forward 里做 Tanh 激活和缩放，现在直接用 Sigmoid
-        predictions_physical = torch.sigmoid(predictions)
+    def forward(self, predictions, inputs):
+        # 基础约束
+        constrained = torch.sigmoid(predictions)
         
-        # 确保 predictions_physical 在 0-1 范围，并进行物理约束
-        constrained_physical = predictions_physical.clone()
-
-        # 工况自适应约束强度
-        # avg_constraint_strength = (self.nn_constraint_strength + self.udds_constraint_strength) / 2 # 已禁用，使用固定值
-
+        # 工况自适应约束 (这里简化处理，实际可以用工况检测结果)
+        # 假设batch内混合了NN和UDDS，使用平均约束强度
+        avg_constraint_strength = (self.nn_constraint_strength + self.udds_constraint_strength) / 2
+        
+        # 处理维度：如果是3D张量 [batch, seq_len, features]，需要在最后一个维度操作
+        original_shape = constrained.shape
+        
         # SOC-SOE耦合约束
         if self.num_outputs >= 2:
-            soc_pred_physical = constrained_physical[:, :, 0] # 物理SOC
-            soe_pred_physical = constrained_physical[:, :, 1] # 物理SOE
+            if len(original_shape) == 3:  # [batch, seq_len, features]
+                soc_pred = constrained[:, :, 0]  # [batch, seq_len]
+                soe_pred = constrained[:, :, 1]  # [batch, seq_len]
+            else:  # [batch, features]
+                soc_pred = constrained[:, 0]
+                soe_pred = constrained[:, 1]
             
-            coupling_strength = self.soc_soe_coupling # 现在是固定值
+            coupling_strength = torch.sigmoid(self.soc_soe_coupling)
+            soe_constrained = torch.minimum(soe_pred, soc_pred + 0.06)
+            new_soe = coupling_strength * soe_constrained + (1 - coupling_strength) * soe_pred
             
-            # 在物理尺度上应用耦合约束
-            soe_constrained_physical = torch.minimum(soe_pred_physical, soc_pred_physical + 0.06)
-            new_soe_physical = coupling_strength * soe_constrained_physical + (1 - coupling_strength) * soe_pred_physical
-            
-            # 将修正后的SOE重新放回物理预测张量，避免原地操作
-            constrained_physical = torch.cat([constrained_physical[:, :, 0:1], new_soe_physical.unsqueeze(-1)], dim=-1)
-
-        # 温度约束 (在物理尺度上应用，如果需要)
+            if len(original_shape) == 3:
+                constrained = torch.stack([soc_pred, new_soe], dim=-1)  # [batch, seq_len, 2]
+            else:
+                constrained = torch.stack([soc_pred, new_soe], dim=-1)  # [batch, 2]
+        
+        # 温度约束
         if self.temp_constraint is not None and self.temperature is not None:
             temp_factor = 1.0 if self.temperature >= 25 else 0.85 + 0.15 * (self.temperature + 20) / 45
-            temp_strength = self.temp_constraint # 现在是固定值
-            # 将整个物理预测值根据温度因子进行调整
-            constrained_physical = temp_strength * constrained_physical * temp_factor + (1 - temp_strength) * constrained_physical
-
-        # 🚨 [关键修改] 在返回前添加显式的 Clamp，确保严格在 0-1 范围
-        constrained_physical_clamped = torch.clamp(constrained_physical, 0.0, 1.0)
-        return constrained_physical_clamped # 返回严格 Clamp 后的物理值
+            temp_strength = torch.sigmoid(self.temp_constraint)
+            constrained = temp_strength * constrained * temp_factor + (1 - temp_strength) * constrained
+        
+        # 应用约束强度
+        strength = torch.sigmoid(avg_constraint_strength)
+        final_output = strength * constrained + (1 - strength) * torch.sigmoid(predictions)
+        
+        return final_output
 
 
 class TrueSOTAElectrochemicalPhysicsLoss(nn.Module):
     """真正SOTA的电化学物理损失函数"""
     
-    def __init__(self, base_weight=1.0, electrochemical_weight=1.5, resistance_loss_factor=0.001, feature_scaler=None): # 新增 feature_scaler 和 resistance_loss_factor
+    def __init__(self, base_weight=1.0, electrochemical_weight=0.025, feature_scaler=None):
         super().__init__()
         self.base_weight = base_weight
-        self.electrochemical_weight = nn.Parameter(torch.tensor(electrochemical_weight)) # 初始值从0.05改为1.5
-        self.loss_balancer = nn.Parameter(torch.tensor(2.0)) # 提高loss_balancer的初始值到2.0
+        self.electrochemical_weight = nn.Parameter(torch.tensor(electrochemical_weight))
+        self.loss_balancer = nn.Parameter(torch.tensor(1.08))
+        self.feature_scaler = feature_scaler # 存储特征标准化器
         
         # 工况特定损失权重
-        self.nn_loss_weight = nn.Parameter(torch.tensor(1.5))    # 提高 nn_loss_weight
-        self.udds_loss_weight = nn.Parameter(torch.tensor(0.8))  # 降低 udds_loss_weight
-        self.feature_scaler = feature_scaler # 存储标准化器
-        self.resistance_loss_factor = resistance_loss_factor # 存储内阻损失因子
+        self.nn_loss_weight = nn.Parameter(torch.tensor(1.2))    # NN需要更大权重
+        self.udds_loss_weight = nn.Parameter(torch.tensor(0.8))  # UDDS保持较小权重
         
     def forward(self, predictions, targets, inputs, workload_probs=None):
         # 基础MSE损失
-        mse_loss = F.mse_loss(predictions, targets) # predictions 和 targets 都应该在 0-1 范围
+        mse_loss = F.mse_loss(predictions, targets)
         
         # 电化学物理损失
         electrochemical_loss = self._compute_electrochemical_loss(predictions, targets, inputs)
@@ -440,16 +408,16 @@ class TrueSOTAElectrochemicalPhysicsLoss(nn.Module):
             nn_prob = workload_probs[:, 0].mean()
             udds_prob = workload_probs[:, 1].mean()
             
-            # 确保损失权重始终为正
-            nn_weight = F.softplus(self.nn_loss_weight)
-            udds_weight = F.softplus(self.udds_loss_weight)
+            # 动态调整损失权重
+            nn_weight = torch.sigmoid(self.nn_loss_weight)
+            udds_weight = torch.sigmoid(self.udds_loss_weight)
             
             adaptive_weight = nn_weight * nn_prob + udds_weight * udds_prob
         else:
             adaptive_weight = 1.0
         
         # 损失平衡
-        electrochemical_weight = self.electrochemical_weight # 直接使用 Parameter 的原始值
+        electrochemical_weight = torch.sigmoid(self.electrochemical_weight) * 0.05
         loss_balance = torch.sigmoid(self.loss_balancer)
         
         total_loss = (
@@ -466,61 +434,61 @@ class TrueSOTAElectrochemicalPhysicsLoss(nn.Module):
     def _compute_electrochemical_loss(self, predictions, targets, inputs):
         """计算电化学物理损失"""
         loss_components = []
-
-        # 确保 predictions 和 targets 已经是物理值 (0-1之间)
-        # 移除所有 target_scaler.inverse_transform 的调用
-        predictions_physical = predictions
-        targets_physical = targets
-
-        # 以下所有损失计算都基于 predictions_physical 和 targets_physical
-
-        # 处理不同维度的predictions (现在都是物理尺度)
-        # 由于现在 predictions_physical 是 [batch, num_outputs] 形状，不需要再进行 `if len(predictions_physical.shape) == 3` 判断
-        # 直接进入 [batch, features] 的处理逻辑
-        # SOC范围约束
-        soc_pred_original = predictions_physical[:, 0]  # 现在已经是物理SOC
-        range_loss = F.relu(soc_pred_original - 1.0).mean() + F.relu(-soc_pred_original).mean()
-        loss_components.append(range_loss) # 确保 range_loss 能够提供足够梯度
         
-        # SOC-SOE一致性约束
-        if predictions_physical.shape[1] >= 2:
-            soe_pred_original = predictions_physical[:, 1] # 现在已经是物理SOE
-            consistency_loss = F.relu(torch.abs(soe_pred_original - soc_pred_original) - 0.12).mean() # 0.12 差距容忍度
-            loss_components.append(consistency_loss)
+        # 处理不同维度的predictions
+        if len(predictions.shape) == 3:  # [batch, seq_len, features]
+            # SOC范围约束
+            soc_pred = predictions[:, :, 0]  # [batch, seq_len]
+            range_loss = F.relu(soc_pred - 1.0).mean() + F.relu(-soc_pred).mean()
+            loss_components.append(range_loss)
+            
+            # SOC-SOE一致性约束
+            if predictions.shape[2] >= 2:
+                soc_pred = predictions[:, :, 0]  # [batch, seq_len]
+                soe_pred = predictions[:, :, 1]  # [batch, seq_len]
+                consistency_loss = F.relu(torch.abs(soe_pred - soc_pred) - 0.12).mean()
+                loss_components.append(consistency_loss)
+        else:  # [batch, features]
+            # SOC范围约束
+            soc_pred = predictions[:, 0]
+            range_loss = F.relu(soc_pred - 1.0).mean() + F.relu(-soc_pred).mean()
+            loss_components.append(range_loss)
+            
+            # SOC-SOE一致性约束
+            if predictions.shape[1] >= 2:
+                soc_pred = predictions[:, 0]
+                soe_pred = predictions[:, 1]
+                consistency_loss = F.relu(torch.abs(soe_pred - soc_pred) - 0.12).mean()
+                loss_components.append(consistency_loss)
         
-        # 电化学平滑性约束 (不适用单时间步预测，保持注释)
-        # if predictions_physical.shape[0] > 1:  # 检查batch维度
-        #     try:
-        #         original_predictions_smooth = predictions_physical.unsqueeze(1).clone() # 增加seq_len维度
-        #         current_targets_smooth = targets_physical.unsqueeze(1).clone() # 增加seq_len维度
-
-        #         pred_diff = torch.diff(original_predictions_smooth, dim=1) 
-        #         target_diff = torch.diff(current_targets_smooth, dim=1)    
-
-        #         if pred_diff.shape == target_diff.shape: # type: ignore
-        #             smoothness_loss = F.mse_loss(pred_diff, target_diff) * 0.06
-        #             loss_components.append(smoothness_loss)
-        #     except RuntimeError as e:
-        #         print(f"⚠️ 平滑性约束计算警告: {e}") 
-        #         pass
+        # 电化学平滑性约束
+        if predictions.shape[0] > 1:  # 检查batch维度
+            try:
+                pred_diff = torch.diff(predictions, dim=0)
+                target_diff = torch.diff(targets, dim=0)
+                # 确保维度匹配
+                if pred_diff.shape == target_diff.shape:
+                    smoothness_loss = F.mse_loss(pred_diff, target_diff) * 0.06
+                    loss_components.append(smoothness_loss)
+            except RuntimeError:
+                # 如果维度不匹配，跳过平滑性约束
+                pass
         
-        # 基于内阻的稳定性约束 (重新引入)
+        # 基于内阻的稳定性约束
         if inputs.shape[-1] > 6 and self.feature_scaler is not None: # 确保有内阻特征和scaler
             # 获取最后一个时间步的内阻特征（标准化后的）
-            normalized_resistance_feature_last_step = inputs[:, -1, 5] # 索引5通常是内阻
+            normalized_resistance_feature = inputs[:, -1, 6] # 索引6通常是内阻
             
             # 对内阻进行逆标准化，得到原始物理值
-            # 注意：这里我们使用的是feature_scaler，它现在是MinMaxScaler
-            # MinMaxScaler的逆变换：original_value = normalized_value * (max - min) + min
-            min_resistance = torch.tensor(self.feature_scaler.data_min_[5], device=inputs.device, dtype=inputs.dtype)
-            max_resistance = torch.tensor(self.feature_scaler.data_max_[5], device=inputs.device, dtype=inputs.dtype)
+            # StandardScaler的逆变换：original_value = normalized_value * std + mean
+            mean_resistance = torch.tensor(self.feature_scaler.mean_[6], device=inputs.device, dtype=inputs.dtype)
+            std_resistance = torch.tensor(self.feature_scaler.scale_[6], device=inputs.device, dtype=inputs.dtype)
             
-            original_resistance_feature = normalized_resistance_feature_last_step * (max_resistance - min_resistance) + min_resistance
+            original_resistance_feature = normalized_resistance_feature * std_resistance + mean_resistance
             
             # 内阻加权预测波动惩罚 (鼓励高内阻时预测更平稳)
-            # 这里我们鼓励预测值不要过大，在高内阻时尤其如此
-            # predictions_physical 形状为 [batch, num_outputs]，所以对最后一个维度求和
-            resistance_penalty = torch.mean(original_resistance_feature * torch.sum(predictions_physical**2, dim=-1)) * self.resistance_loss_factor
+            # predictions 形状为 [batch, num_outputs]，所以对最后一个维度求和
+            resistance_penalty = torch.mean(original_resistance_feature * torch.sum(predictions**2, dim=-1)) * 0.01
             loss_components.append(resistance_penalty)
         
         return sum(loss_components) if loss_components else torch.tensor(0.0, device=predictions.device)
@@ -529,12 +497,17 @@ class TrueSOTAElectrochemicalPhysicsLoss(nn.Module):
 class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
     """真正SOTA的电化学Lightning模块"""
     
-    def __init__(self, hparams, feature_scaler=None): # 移除 target_scaler 参数
+    def __init__(self, hparams):
         super().__init__()
         if isinstance(hparams, dict): 
             hparams = argparse.Namespace(**hparams)
         self.save_hyperparameters(hparams)
         
+        # 获取特征标准化器
+        datamodule = ElectrochemicalDataModule(hparams) # 临时实例化DataModule以获取scaler
+        datamodule.setup(stage='fit')
+        feature_scaler = datamodule.feature_scaler
+
         self.model = TrueSOTAElectrochemicalKANTransformer(
             input_dim=46,
             num_heads=hparams.num_heads, 
@@ -545,27 +518,23 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
             embed_dim=hparams.embed_dim, 
             grid_size=hparams.grid_size,
             temperature=getattr(hparams, 'temperature', None),
-            feature_scaler=feature_scaler, # 传递特征标准化器给模型
-            detector_temp_init=getattr(hparams, 'detector_temp_init', 0.7)
+            feature_scaler=feature_scaler # 传递特征标准化器给模型
         )
         
         self.criterion = TrueSOTAElectrochemicalPhysicsLoss(
-            electrochemical_weight=getattr(hparams, 'electrochemical_weight', 0.5),
-            resistance_loss_factor=getattr(hparams, 'resistance_loss_factor', 0.001), # 新增：传递 resistance_loss_factor
+            electrochemical_weight=getattr(hparams, 'electrochemical_weight', 0.025),
             feature_scaler=feature_scaler # 传递特征标准化器给损失函数
         )
-        self.gate_entropy_weight = getattr(hparams, "gate_entropy_weight", 0.01)
         
         self.automatic_optimization = True
         self.test_step_outputs = []
         self.current_epoch_num = 0
-        # self.feature_scaler = feature_scaler # 存储标准化器 - 移至模型构造函数
         
     def forward(self, x): 
         return self.model(x)
     
     def training_step(self, batch, batch_idx):
-        x, y, _, labels = batch # 新的数据模块会返回原始索引和工况标签
+        x, y = batch
         
         # 数据增强 (针对NN优化)
         if self.training:
@@ -577,8 +546,6 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
         # 前向传播
         y_hat, workload_probs = self.model(x, return_uncertainty=True)
         total_loss, loss_components = self.criterion(y_hat, y, x, workload_probs)
-        gate_entropy = -(workload_probs * torch.log(torch.clamp(workload_probs, min=1e-6))).sum(dim=1).mean()
-        total_loss = total_loss + self.gate_entropy_weight * gate_entropy
         
         # 数值稳定性检查
         if torch.isnan(total_loss) or torch.isinf(total_loss): 
@@ -587,7 +554,6 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
         # 日志记录
         self.log('train_loss', total_loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log_dict({f'train_{k}': v for k, v in loss_components.items()}, on_step=False, on_epoch=True)
-        self.log('gate_entropy', gate_entropy, on_step=False, on_epoch=True)
         
         with torch.no_grad(): 
             train_rmse = torch.sqrt(F.mse_loss(y_hat, y))
@@ -596,7 +562,7 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
         return total_loss
     
     def validation_step(self, batch, batch_idx):
-        x, y, _, labels = batch # 新的数据模块会返回原始索引和工况标签
+        x, y = batch
         y_hat = self.forward(x)
         val_loss = F.mse_loss(y_hat, y)
         val_rmse = torch.sqrt(val_loss)
@@ -605,9 +571,9 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
         self.log('val_rmse', val_rmse, on_epoch=True, prog_bar=True)
     
     def test_step(self, batch, batch_idx, dataloader_idx=0):
-        x, y, original_end_indices, labels = batch # 接收原始结束索引和工况标签
+        x, y = batch
         y_hat = self.forward(x)
-        self.test_step_outputs[dataloader_idx].append({'y_true': y.cpu(), 'y_pred': y_hat.cpu(), 'original_end_indices': original_end_indices.cpu(), 'labels': labels.cpu()})
+        self.test_step_outputs[dataloader_idx].append({'y_true': y.cpu(), 'y_pred': y_hat.cpu()})
     
     def on_test_start(self): 
         self.test_step_outputs = [[] for _ in range(2)]
@@ -635,15 +601,12 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
             # 处理不同序列长度的张量连接问题
             y_true_list = []
             y_pred_list = []
-            original_end_indices_list = [] # 新增：用于收集原始索引
             for x in outputs:
                 # 统一处理：确保都是2D [batch, features]
                 if len(x['y_true'].shape) == 3:  # [batch, seq_len, features]
                     y_true_list.append(x['y_true'][:, -1, :])  # 取最后一个时间步
-                    original_end_indices_list.append(x['original_end_indices'][:, -1]) # 收集原始索引
                 else:  # [batch, features]
                     y_true_list.append(x['y_true'])
-                    original_end_indices_list.append(x['original_end_indices']) # 收集原始索引
                     
                 if len(x['y_pred'].shape) == 3:  # [batch, seq_len, features]
                     y_pred_list.append(x['y_pred'][:, -1, :])  # 取最后一个时间步
@@ -654,44 +617,23 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
             try:
                 y_true = torch.cat(y_true_list).numpy()
                 y_pred = torch.cat(y_pred_list).numpy()
-                original_end_indices = torch.cat(original_end_indices_list).numpy() # 合并原始索引
             except RuntimeError as e:
                 print(f"⚠️  张量连接警告: {str(e)}")
                 # 如果仍然失败，逐个检查并修复维度
                 fixed_y_true_list = []
                 fixed_y_pred_list = []
-                fixed_original_end_indices_list = [] # 新增：用于收集修复后的原始索引
-                for yt, yp, oei in zip(y_true_list, y_pred_list, original_end_indices_list):
+                for yt, yp in zip(y_true_list, y_pred_list):
                     # 确保都是2D且特征数一致
                     if len(yt.shape) == 2 and len(yp.shape) == 2:
                         if yt.shape[1] == yp.shape[1]:  # 特征数一致
                             fixed_y_true_list.append(yt)
                             fixed_y_pred_list.append(yp)
-                            fixed_original_end_indices_list.append(oei) # 收集修复后的原始索引
                 
                 y_true = torch.cat(fixed_y_true_list).numpy()
                 y_pred = torch.cat(fixed_y_pred_list).numpy()
-                original_end_indices = torch.cat(fixed_original_end_indices_list).numpy() # 合并修复后的原始索引
             
             dataset_name = dataset_names[i]
-            
-            # --- 新增: 保存原始预测数据 ---
-            save_dir = os.path.join(self.trainer.logger.log_dir or '.', 'raw_predictions')
-            os.makedirs(save_dir, exist_ok=True)
-            
-            model_identifier = "KAN-Transformer_46feat"
-            true_path = os.path.join(save_dir, f'{model_identifier}_{dataset_name}_true.npy')
-            pred_path = os.path.join(save_dir, f'{model_identifier}_{dataset_name}_pred.npy')
-            
-            np.save(true_path, y_true)
-            np.save(pred_path, y_pred)
-            # 同时保存原始时间轴索引，以便生成_true.npy和_pred.npy时作为横坐标
-            np.save(os.path.join(save_dir, f'{model_identifier}_{dataset_name}_time_axis.npy'), original_end_indices)
-            print(f"   📊 {model_identifier} {dataset_name} 原始预测数据已保存: {pred_path}")
-            print(f"   📊 {model_identifier} {dataset_name} 原始时间轴索引已保存: {os.path.join(save_dir, f'{model_identifier}_{dataset_name}_time_axis.npy')}")
-            # --- 新增结束 ---
-
-            time_axis = original_end_indices # 使用原始时间轴索引作为横坐标
+            time_axis = np.arange(len(y_true))
             
             for j, feature in enumerate(self.hparams.output_features):
                 # === SCI级别预测结果图 - 完全参照用户参考图 ===
@@ -882,6 +824,100 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
         }
 
 
+class ElectrochemicalDataModule(pl.LightningDataModule):
+    """电化学数据模块"""
+    
+    def __init__(self, hparams):
+        super().__init__()
+        self.save_hyperparameters(hparams)
+        self.feature_engineer = None
+        self.feature_scaler = None # 初始化特征标准化器
+        
+    def setup(self, stage=None):
+        print(f"🧪 开始电化学特征工程 ({self.hparams.temperature}°C)")
+        
+        # 使用新的电化学特征数据集
+        train_features, train_targets, test_datasets, self.feature_engineer = create_electrochemical_dataset(
+            self.hparams.train_paths, 
+            self.hparams.test_paths,
+            self.hparams.temperature,
+            window_size=self.hparams.window_size,
+            overlap_ratio=0.5
+        )
+        
+        # 确保特征维度正确
+        assert train_features.shape[-1] == 46, f"期望46个特征，实际得到{train_features.shape[-1]}个"
+        self.hparams.input_dim = 46
+
+        # === 标准化处理：仅在训练集上拟合，再用于验证/测试 ===
+        self.feature_scaler = StandardScaler()
+        # reshape train_features from [samples, window_size, features] to [samples * window_size, features]
+        train_features_2d = train_features.reshape(-1, train_features.shape[-1])
+        self.feature_scaler.fit(train_features_2d)
+        # Transform training features and reshape back
+        train_features = self.feature_scaler.transform(train_features_2d).reshape(train_features.shape)
+        
+        # 数据转换
+        X_train_tensor = torch.from_numpy(train_features).float()
+        y_train_tensor = torch.from_numpy(train_targets).float()
+        
+        # 数据划分
+        dataset_size = len(X_train_tensor)
+        train_size = int(0.93 * dataset_size)  # 93% 训练
+        val_size = dataset_size - train_size   # 7% 验证
+        print(f"📊 数据划分 (93%/7%): 训练={train_size:,}, 验证={val_size:,}")
+        
+        full_dataset = torch.utils.data.TensorDataset(X_train_tensor, y_train_tensor)
+        self.train_dataset, self.val_dataset = torch.utils.data.random_split(
+            full_dataset, [train_size, val_size], 
+            generator=torch.Generator().manual_seed(42)
+        )
+        
+        # 测试数据集处理
+        self.test_datasets = []
+        for test_dict in test_datasets:
+            test_features = test_dict['features']
+            test_targets = test_dict['targets']
+            # 使用训练集拟合的Scaler变换测试特征
+            test_features = self.feature_scaler.transform(
+                test_features.reshape(-1, test_features.shape[-1])
+            ).reshape(test_features.shape)
+            test_dataset = torch.utils.data.TensorDataset(
+                torch.from_numpy(test_features).float(),
+                torch.from_numpy(test_targets).float()
+            )
+            self.test_datasets.append(test_dataset)
+            
+        print(f"✅ 电化学数据准备完成 (46个科学特征)")
+    
+    def train_dataloader(self): 
+        return torch.utils.data.DataLoader(
+            self.train_dataset, 
+            batch_size=self.hparams.batch_size, 
+            shuffle=True, 
+            num_workers=self.hparams.num_workers, 
+            pin_memory=True,
+            drop_last=True
+        )
+    
+    def val_dataloader(self): 
+        return torch.utils.data.DataLoader(
+            self.val_dataset, 
+            batch_size=self.hparams.batch_size, 
+            num_workers=self.hparams.num_workers, 
+            pin_memory=True,
+            drop_last=True
+        )
+    
+    def test_dataloader(self): 
+        return [torch.utils.data.DataLoader(
+            ds, 
+            batch_size=self.hparams.batch_size, 
+            num_workers=self.hparams.num_workers, 
+            pin_memory=True
+        ) for ds in self.test_datasets]
+
+
 class MemoryCleanupCallback(Callback):
     """内存清理回调"""
     def on_train_epoch_end(self, trainer, pl_module): 
@@ -890,14 +926,6 @@ class MemoryCleanupCallback(Callback):
 
 
 def main():
-    # 检查CUDA是否可用
-    if torch.cuda.is_available():
-        print(f"✅ PyTorch检测到CUDA可用。设备数量: {torch.cuda.device_count()}")
-        for i in range(torch.cuda.device_count()):
-            print(f"   - GPU {i}: {torch.cuda.get_device_name(i)}")
-    else:
-        print("❌ PyTorch未检测到CUDA。请检查CUDA安装和驱动。")
-
     parser = argparse.ArgumentParser(description='25°C真正SOTA训练 - 保持UDDS优势+提升NN')
     
     # === 数据路径 ===
@@ -915,12 +943,10 @@ def main():
         r"C:\25degC training\03-21-17_09.38 25degC_LA92_Pan18650PF.csv",  # 原LA92训练集现在用于测试
         r"C:\25degC testing\03-21-17_00.29 25degC_UDDS_Pan18650PF.csv"   # UDDS保持不变
     ])
-    parser.add_argument('--result_dir', type=str, default='true_sota_25degC_LA92_test_results_step16')
+    parser.add_argument('--result_dir', type=str, default='true_sota_25degC_LA92_test_results')
     parser.add_argument('--output_features', type=str, default='SOC,SOE')
     parser.add_argument('--window_size', type=int, default=32)
-    parser.add_argument('--overlap_ratio', type=float, default=0.5) # 步长为16（最优配置）
     parser.add_argument('--temperature', type=float, default=25.0)
-    parser.add_argument('--model_name', type=str, default='KAN-Transformer', help='Name of the model for logging and display.')
     
     # === [真正SOTA] 架构参数 ===
     parser.add_argument('--n_layers', type=int, default=5)      # 适中的层数
@@ -932,24 +958,17 @@ def main():
     parser.add_argument('--dropout', type=float, default=0.20)         # 适中的dropout
     parser.add_argument('--weight_decay', type=float, default=0.0006)  # 适中的weight_decay
     parser.add_argument('--noise_factor', type=float, default=0.004)   # 轻微噪声
-    parser.add_argument('--electrochemical_weight', type=float, default=0.05) # 恢复为更保守的0.05
-    parser.add_argument('--resistance_loss_factor', type=float, default=0.001, help='Factor for resistance-based stability loss.') # 保持不变
-    parser.add_argument('--gate_entropy_weight', type=float, default=0.01, help='Entropy penalty to sharpen workload detector.')
-    parser.add_argument('--detector_temp_init', type=float, default=0.7, help='Initial temperature for workload detector softmax.')
+    parser.add_argument('--electrochemical_weight', type=float, default=0.025) # 平衡的物理权重
     
     # === [真正SOTA] 训练参数 ===
     parser.add_argument('--grid_size', type=int, default=24)       # 高精度KAN
-    parser.add_argument('--num_epochs', type=int, default=300)     # 增加到300
-    parser.add_argument('--batch_size', type=int, default=32)      
-    parser.add_argument('--patience', type=int, default=45)        # 增加到45
+    parser.add_argument('--num_epochs', type=int, default=200)     # 200个周期训练
+    parser.add_argument('--batch_size', type=int, default=32)      # 稳定的批次大小
+    parser.add_argument('--patience', type=int, default=30)        # 适中的patience
     parser.add_argument('--seed', type=int, default=42)
-    parser.add_argument('--lr', type=float, default=0.0004)        # 降低学习率到0.0004
-    parser.add_argument('--gpus', type=int, default=1, help='Number of GPUs to use')
-    parser.add_argument('--num_workers', type=int, default=0, help='Number of data loader workers')
-    parser.add_argument('--debug_mode', action='store_true', help='Enable debug mode (e.g., fewer epochs, smaller dataset)')
-    parser.add_argument('--ckpt_path', type=str, default=None, help='Path to a pre-trained checkpoint to load for testing')
+    parser.add_argument('--lr', type=float, default=0.0006)        # 平衡的学习率
+    parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=2)  # 轻微的梯度累积
-    parser.add_argument('--train_val_split_ratio', type=float, default=0.93, help='Ratio for training set split from total training data.')
     
     args = parser.parse_args()
     args.output_features = [item.strip() for item in args.output_features.split(',')]
@@ -970,14 +989,10 @@ def main():
     
     try:
         pl.seed_everything(args.seed, workers=True)
-        datamodule = Electrochemical46FeaturesDataModule(args) # 使用新的KAN数据模块
-        datamodule.setup(stage='fit') # 显式调用setup，并传入stage
+        datamodule = ElectrochemicalDataModule(args)
+        datamodule.setup()
         
-        # 获取全局标准化器
-        scalers_dict = datamodule.scaler
-        feature_scaler = scalers_dict['features']
-
-        model = TrueSOTAElectrochemicalLightningModule(args, feature_scaler=feature_scaler) # 传递 feature_scaler
+        model = TrueSOTAElectrochemicalLightningModule(args)
         
         # 回调函数设置
         checkpoint_callback = ModelCheckpoint(
@@ -990,15 +1005,11 @@ def main():
         )
         lr_monitor = LearningRateMonitor(logging_interval='epoch')
         
-        # 显式配置logger，使其保存到args.result_dir
-        from pytorch_lightning.loggers import TensorBoardLogger
-        logger = TensorBoardLogger(save_dir=args.result_dir, name='', version='') # name为空，version为空，直接保存到save_dir
-
         # 训练器设置
         trainer = pl.Trainer(
             max_epochs=args.num_epochs, 
-            accelerator='gpu', # 明确指定使用GPU
-            devices=args.gpus, # 使用ArgumentParser中定义的GPU数量
+            accelerator='auto', 
+            devices=1,
             callbacks=[
                 checkpoint_callback, 
                 early_stop_callback, 
@@ -1009,23 +1020,14 @@ def main():
             gradient_clip_val=0.5,
             accumulate_grad_batches=args.gradient_accumulation_steps,
             deterministic=False,
-            benchmark=True,
-            logger=logger # 传入配置好的logger
+            benchmark=True
         )
         
-        print(f"\n🚀 开始 {args.model_name} 训练...")
-
-        if args.ckpt_path:
-            print(f"   跳过训练，从检查点加载模型: {args.ckpt_path}")
-            # 直接加载模型并测试
-            model = type(model).load_from_checkpoint(args.ckpt_path, hparams=args) # 重新传入hparams
-            trainer.test(model, datamodule=datamodule)
-        else:
-            # 正常训练流程
-            trainer.fit(model, datamodule)
-            print(f"\n📊 测试 {args.model_name} 模型...")
-            # 使用最佳检查点进行测试
-            trainer.test(model, datamodule=datamodule, ckpt_path='best')
+        print(f"\n🚀 开始真正SOTA训练...")
+        trainer.fit(model, datamodule)
+        
+        print(f"\n📊 测试真正SOTA模型...")
+        trainer.test(model, datamodule=datamodule, ckpt_path='best')
         
         print(f"\n✅ 真正SOTA训练完成！")
         print(f"📁 结果保存在: {args.result_dir}")
