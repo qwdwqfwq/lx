@@ -704,7 +704,7 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
                            hspace=0.35, wspace=0.25)  # 增加底部空间给Fig.10说明
         
         # 保存高质量SCI图表 - 参照参考图格式
-        save_path = os.path.join(self.trainer.logger.log_dir or '.', 
+        save_path = os.path.join(self.trainer.default_root_dir, 
                                'true_sota_25degC_SCI_paper_style.png')
         plt.savefig(save_path, dpi=300, bbox_inches='tight', facecolor='white', 
                     edgecolor='none', format='png', pad_inches=0.1)
@@ -713,15 +713,12 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
         # 保存测试指标
         results_df = pd.DataFrame(overall_results).T
         results_df.index.name = 'Dataset_Feature'
-        results_csv_path = os.path.join(self.trainer.logger.log_dir or '.', 
+        results_csv_path = os.path.join(self.trainer.default_root_dir, 
                                       'true_sota_25degC_test_metrics.csv')
         results_df.to_csv(results_csv_path)
         print(f"📊 测试指标结果已保存: {results_csv_path}")
 
-        # === 保存预测序列、真实值和时间戳 ===
-        all_y_true = []
-        all_y_pred = []
-        all_time_axis = []
+        # === 保存预测序列、真实值和时间戳 (按数据集和特征单独保存) ===
         for i, outputs in enumerate(self.test_step_outputs):
             if not outputs: continue
             
@@ -741,34 +738,21 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
             y_true_concat = torch.cat(y_true_list).numpy()
             y_pred_concat = torch.cat(y_pred_list).numpy()
             time_axis_concat = np.arange(len(y_true_concat))
-
-            all_y_true.append(y_true_concat)
-            all_y_pred.append(y_pred_concat)
-            all_time_axis.append(time_axis_concat)
-
-        # 将所有数据集的结果合并到一个 DataFrame
-        combined_data = pd.DataFrame()
-        for i, dataset_name in enumerate(dataset_names):
-            if i < len(all_y_true): # 确保索引有效
-                df_temp = pd.DataFrame({
-                    'Time(s)': all_time_axis[i],
-                    f'{dataset_name}_SOC_Actual': all_y_true[i][:, 0],
-                    f'{dataset_name}_SOC_Predicted': all_y_pred[i][:, 0],
-                    f'{dataset_name}_SOE_Actual': all_y_true[i][:, 1],
-                    f'{dataset_name}_SOE_Predicted': all_y_pred[i][:, 1],
+            
+            dataset_name = dataset_names[i]
+            for j, feature in enumerate(self.hparams.output_features):
+                df_predictions = pd.DataFrame({
+                    'Time(s)': time_axis_concat,
+                    f'{feature}_Actual': y_true_concat[:, j],
+                    f'{feature}_Predicted': y_pred_concat[:, j],
                 })
-                if combined_data.empty:
-                    combined_data = df_temp
-                else:
-                    # 按照时间戳合并，如果时间戳不一致，可能需要更复杂的合并逻辑
-                    # 这里假设每个数据集的时间戳是独立的，简单地拼接
-                    combined_data = pd.concat([combined_data, df_temp], axis=1)
-
-        predictions_csv_path = os.path.join(self.trainer.logger.log_dir or '.',
-                                          'true_sota_25degC_predictions.csv')
-        combined_data.to_csv(predictions_csv_path, index=False)
-        print(f"📊 预测序列、真实值和时间戳已保存: {predictions_csv_path}")
-
+                prediction_csv_path = os.path.join(
+                    self.trainer.default_root_dir, 
+                    f'{dataset_name}_{feature}_predictions.csv'
+                )
+                df_predictions.to_csv(prediction_csv_path, index=False)
+                print(f"📊 {dataset_name} - {feature} 预测序列、真实值和时间戳已保存: {prediction_csv_path}")
+        
         # 综合性能分析
         avg_rmse = np.mean([r['RMSE'] for r in overall_results.values()])
         avg_mae = np.mean([r['MAE'] for r in overall_results.values()])
@@ -1028,6 +1012,8 @@ def main():
             max_epochs=args.num_epochs, 
             accelerator='auto', 
             devices=1,
+            logger=False, # 禁用默认的logger，确保所有内容都保存在default_root_dir
+            default_root_dir=args.result_dir, # 将默认根目录设置为args.result_dir
             callbacks=[
                 checkpoint_callback, 
                 early_stop_callback, 
