@@ -1,17 +1,3 @@
-﻿
-
-"""
-25°C真正SOTA训练脚本 - 保持UDDS优势，大幅提升NN
-正确的优化思路：不是平衡，而是双重提升
-
-🎯 正确策略:
-1. 保持UDDS的优秀性能 (0.012左右)
-2. 专门针对NN工况的深度优化
-3. 工况特定的架构分支
-4. 自适应损失加权
-5. 目标: UDDS保持0.012，NN降到0.015，整体突破0.018
-"""
-
 import argparse
 import os
 import gc
@@ -24,7 +10,6 @@ import torch.nn.functional as F
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import ModelCheckpoint, EarlyStopping, Callback, LearningRateMonitor
 from sklearn.metrics import mean_squared_error, r2_score, mean_absolute_error
-from sklearn.preprocessing import StandardScaler
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from scipy.signal import savgol_filter
@@ -91,13 +76,12 @@ class TrueSOTAElectrochemicalKANTransformer(nn.Module):
     
     def __init__(self, input_dim, num_heads, num_layers, num_outputs, 
                  hidden_space, dropout_rate, embed_dim, grid_size=16,
-                 temperature=None, feature_scaler=None):
+                 temperature=None):
         super().__init__()
         
         self.input_dim = input_dim
         self.num_outputs = num_outputs
         self.temperature = temperature
-        self.feature_scaler = feature_scaler # 存储特征标准化器
         
         # === [策略1] 保持成功的特征编码器 ===
         # 基于UDDS成功经验的特征分组编码
@@ -292,29 +276,32 @@ class TrueSOTAElectrochemicalKANTransformer(nn.Module):
         
         # === 自适应融合 ===
         # 根据工况概率动态融合
-        nn_weight = nn_prob.unsqueeze(1).unsqueeze(2)
-        udds_weight = udds_prob.unsqueeze(1).unsqueeze(2)
+        nn_weight = nn_prob.unsqueeze(1).unsqueeze(2) # [batch, 1, 1]
+        udds_weight = udds_prob.unsqueeze(1).unsqueeze(2) # [batch, 1, 1]
         
         weighted_features = nn_enhanced * nn_weight + udds_enhanced * udds_weight
         
-        # === 主要Transformer处理 ===
-        transformer_output = self.main_transformer(weighted_features)
+        # === 主要Transformer处理 (现在只输出最后一个时间步) ===
+        # 修正：self.main_transformer 已输出 [batch, num_outputs] 形状，无需再取[:, -1, :]
+        transformer_output = self.main_transformer(weighted_features) # [batch, num_outputs]
         
-        # === 工况特定预测 ===
-        nn_pred = self.nn_prediction_head(weighted_features.mean(dim=1))
-        udds_pred = self.udds_prediction_head(weighted_features.mean(dim=1))
+        # === 工况特定预测 (输出单点预测) ===
+        nn_pred = self.nn_prediction_head(weighted_features.mean(dim=1)) # [batch, num_outputs]
+        udds_pred = self.udds_prediction_head(weighted_features.mean(dim=1)) # [batch, num_outputs]
         
-        # 加权预测
-        final_prediction = (nn_pred * nn_weight.squeeze(1).squeeze(1).unsqueeze(1) + 
-                          udds_pred * udds_weight.squeeze(1).squeeze(1).unsqueeze(1))
+        # 加权预测 (使用 [batch, 1] 权重与 [batch, num_outputs] 预测进行广播)
+        final_prediction = (nn_pred * nn_weight.squeeze(1) + 
+                          udds_pred * udds_weight.squeeze(1)) # [batch, num_outputs]
         
-        # 融合transformer输出和特定预测
-        combined_output = 0.6 * transformer_output + 0.4 * final_prediction.unsqueeze(1)
+        # 融合transformer的单点输出和特定预测头输出
+        combined_output = 0.6 * transformer_output + 0.4 * final_prediction # [batch, num_outputs]
         
         # === 物理约束 ===
-        constrained_output = self.electrochemical_constraint(combined_output, x)
+        # 约束层期望 [batch, seq_len, features]，所以将单点输出扩展为 seq_len=1，然后压缩回去
+        constrained_output = self.electrochemical_constraint(combined_output.unsqueeze(1), x[:, -1, :].unsqueeze(1))
+        constrained_output = constrained_output.squeeze(1) # 最终输出是 [batch, num_outputs]
         
-        if return_uncertainty:
+        if return_uncertainty: 
             return constrained_output, workload_probs
         
         return constrained_output
@@ -385,12 +372,11 @@ class TrueSOTAConstraintLayer(nn.Module):
 class TrueSOTAElectrochemicalPhysicsLoss(nn.Module):
     """真正SOTA的电化学物理损失函数"""
     
-    def __init__(self, base_weight=1.0, electrochemical_weight=0.025, feature_scaler=None):
+    def __init__(self, base_weight=1.0, electrochemical_weight=0.025):
         super().__init__()
         self.base_weight = base_weight
         self.electrochemical_weight = nn.Parameter(torch.tensor(electrochemical_weight))
         self.loss_balancer = nn.Parameter(torch.tensor(1.08))
-        self.feature_scaler = feature_scaler # 存储特征标准化器
         
         # 工况特定损失权重
         self.nn_loss_weight = nn.Parameter(torch.tensor(1.2))    # NN需要更大权重
@@ -461,34 +447,23 @@ class TrueSOTAElectrochemicalPhysicsLoss(nn.Module):
                 consistency_loss = F.relu(torch.abs(soe_pred - soc_pred) - 0.12).mean()
                 loss_components.append(consistency_loss)
         
-        # 电化学平滑性约束
-        if predictions.shape[0] > 1:  # 检查batch维度
-            try:
-                pred_diff = torch.diff(predictions, dim=0)
-                target_diff = torch.diff(targets, dim=0)
-                # 确保维度匹配
-                if pred_diff.shape == target_diff.shape:
-                    smoothness_loss = F.mse_loss(pred_diff, target_diff) * 0.06
-                    loss_components.append(smoothness_loss)
-            except RuntimeError:
-                # 如果维度不匹配，跳过平滑性约束
-                pass
+        # 电化学平滑性约束 (不适用单点预测，故注释掉)
+        # if predictions.shape[0] > 1:  # 检查batch维度
+        #     try:
+        #         pred_diff = torch.diff(predictions, dim=0)
+        #         target_diff = torch.diff(targets, dim=0)
+        #         # 确保维度匹配
+        #         if pred_diff.shape == target_diff.shape:
+        #             smoothness_loss = F.mse_loss(pred_diff, target_diff) * 0.06
+        #             loss_components.append(smoothness_loss)
+        #     except RuntimeError:
+        #         # 如果维度不匹配，跳过平滑性约束
+        #         pass
         
         # 基于内阻的稳定性约束
-        if inputs.shape[-1] > 6 and self.feature_scaler is not None: # 确保有内阻特征和scaler
-            # 获取最后一个时间步的内阻特征（标准化后的）
-            normalized_resistance_feature = inputs[:, -1, 6] # 索引6通常是内阻
-            
-            # 对内阻进行逆标准化，得到原始物理值
-            # StandardScaler的逆变换：original_value = normalized_value * std + mean
-            mean_resistance = torch.tensor(self.feature_scaler.mean_[6], device=inputs.device, dtype=inputs.dtype)
-            std_resistance = torch.tensor(self.feature_scaler.scale_[6], device=inputs.device, dtype=inputs.dtype)
-            
-            original_resistance_feature = normalized_resistance_feature * std_resistance + mean_resistance
-            
-            # 内阻加权预测波动惩罚 (鼓励高内阻时预测更平稳)
-            # predictions 形状为 [batch, num_outputs]，所以对最后一个维度求和
-            resistance_penalty = torch.mean(original_resistance_feature * torch.sum(predictions**2, dim=-1)) * 0.01
+        if inputs.shape[-1] > 6:
+            resistance_feature = inputs[:, :, 6].mean(dim=1)
+            resistance_penalty = torch.mean(resistance_feature * torch.var(predictions, dim=0).sum()) * 0.01
             loss_components.append(resistance_penalty)
         
         return sum(loss_components) if loss_components else torch.tensor(0.0, device=predictions.device)
@@ -503,11 +478,6 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
             hparams = argparse.Namespace(**hparams)
         self.save_hyperparameters(hparams)
         
-        # 获取特征标准化器
-        datamodule = ElectrochemicalDataModule(hparams) # 临时实例化DataModule以获取scaler
-        datamodule.setup(stage='fit')
-        feature_scaler = datamodule.feature_scaler
-
         self.model = TrueSOTAElectrochemicalKANTransformer(
             input_dim=46,
             num_heads=hparams.num_heads, 
@@ -517,13 +487,11 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
             dropout_rate=hparams.dropout, 
             embed_dim=hparams.embed_dim, 
             grid_size=hparams.grid_size,
-            temperature=getattr(hparams, 'temperature', None),
-            feature_scaler=feature_scaler # 传递特征标准化器给模型
+            temperature=getattr(hparams, 'temperature', None)
         )
         
         self.criterion = TrueSOTAElectrochemicalPhysicsLoss(
-            electrochemical_weight=getattr(hparams, 'electrochemical_weight', 0.025),
-            feature_scaler=feature_scaler # 传递特征标准化器给损失函数
+            electrochemical_weight=getattr(hparams, 'electrochemical_weight', 0.025)
         )
         
         self.automatic_optimization = True
@@ -535,6 +503,9 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
     
     def training_step(self, batch, batch_idx):
         x, y = batch
+        # 适配模型输出为单点预测，目标y也只取最后一个时间步进行损失计算
+        # 修正：y已是 [batch, num_outputs] 形状，无需再取[:, -1, :]
+        # y = y[:, -1, :]
         
         # 数据增强 (针对NN优化)
         if self.training:
@@ -563,6 +534,9 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
     
     def validation_step(self, batch, batch_idx):
         x, y = batch
+        # 适配模型输出为单点预测，目标y也只取最后一个时间步
+        # 修正：y已是 [batch, num_outputs] 形状，无需再取[:, -1, :]
+        # y = y[:, -1, :]
         y_hat = self.forward(x)
         val_loss = F.mse_loss(y_hat, y)
         val_rmse = torch.sqrt(val_loss)
@@ -743,7 +717,58 @@ class TrueSOTAElectrochemicalLightningModule(pl.LightningModule):
                                       'true_sota_25degC_test_metrics.csv')
         results_df.to_csv(results_csv_path)
         print(f"📊 测试指标结果已保存: {results_csv_path}")
-        
+
+        # === 保存预测序列、真实值和时间戳 ===
+        all_y_true = []
+        all_y_pred = []
+        all_time_axis = []
+        for i, outputs in enumerate(self.test_step_outputs):
+            if not outputs: continue
+            
+            y_true_list = []
+            y_pred_list = []
+            for x in outputs:
+                if len(x['y_true'].shape) == 3:
+                    y_true_list.append(x['y_true'][:, -1, :])
+                else:
+                    y_true_list.append(x['y_true'])
+                    
+                if len(x['y_pred'].shape) == 3:
+                    y_pred_list.append(x['y_pred'][:, -1, :])
+                else:
+                    y_pred_list.append(x['y_pred'])
+
+            y_true_concat = torch.cat(y_true_list).numpy()
+            y_pred_concat = torch.cat(y_pred_list).numpy()
+            time_axis_concat = np.arange(len(y_true_concat))
+
+            all_y_true.append(y_true_concat)
+            all_y_pred.append(y_pred_concat)
+            all_time_axis.append(time_axis_concat)
+
+        # 将所有数据集的结果合并到一个 DataFrame
+        combined_data = pd.DataFrame()
+        for i, dataset_name in enumerate(dataset_names):
+            if i < len(all_y_true): # 确保索引有效
+                df_temp = pd.DataFrame({
+                    'Time(s)': all_time_axis[i],
+                    f'{dataset_name}_SOC_Actual': all_y_true[i][:, 0],
+                    f'{dataset_name}_SOC_Predicted': all_y_pred[i][:, 0],
+                    f'{dataset_name}_SOE_Actual': all_y_true[i][:, 1],
+                    f'{dataset_name}_SOE_Predicted': all_y_pred[i][:, 1],
+                })
+                if combined_data.empty:
+                    combined_data = df_temp
+                else:
+                    # 按照时间戳合并，如果时间戳不一致，可能需要更复杂的合并逻辑
+                    # 这里假设每个数据集的时间戳是独立的，简单地拼接
+                    combined_data = pd.concat([combined_data, df_temp], axis=1)
+
+        predictions_csv_path = os.path.join(self.trainer.logger.log_dir or '.',
+                                          'true_sota_25degC_predictions.csv')
+        combined_data.to_csv(predictions_csv_path, index=False)
+        print(f"📊 预测序列、真实值和时间戳已保存: {predictions_csv_path}")
+
         # 综合性能分析
         avg_rmse = np.mean([r['RMSE'] for r in overall_results.values()])
         avg_mae = np.mean([r['MAE'] for r in overall_results.values()])
@@ -831,7 +856,6 @@ class ElectrochemicalDataModule(pl.LightningDataModule):
         super().__init__()
         self.save_hyperparameters(hparams)
         self.feature_engineer = None
-        self.feature_scaler = None # 初始化特征标准化器
         
     def setup(self, stage=None):
         print(f"🧪 开始电化学特征工程 ({self.hparams.temperature}°C)")
@@ -848,14 +872,6 @@ class ElectrochemicalDataModule(pl.LightningDataModule):
         # 确保特征维度正确
         assert train_features.shape[-1] == 46, f"期望46个特征，实际得到{train_features.shape[-1]}个"
         self.hparams.input_dim = 46
-
-        # === 标准化处理：仅在训练集上拟合，再用于验证/测试 ===
-        self.feature_scaler = StandardScaler()
-        # reshape train_features from [samples, window_size, features] to [samples * window_size, features]
-        train_features_2d = train_features.reshape(-1, train_features.shape[-1])
-        self.feature_scaler.fit(train_features_2d)
-        # Transform training features and reshape back
-        train_features = self.feature_scaler.transform(train_features_2d).reshape(train_features.shape)
         
         # 数据转换
         X_train_tensor = torch.from_numpy(train_features).float()
@@ -878,10 +894,6 @@ class ElectrochemicalDataModule(pl.LightningDataModule):
         for test_dict in test_datasets:
             test_features = test_dict['features']
             test_targets = test_dict['targets']
-            # 使用训练集拟合的Scaler变换测试特征
-            test_features = self.feature_scaler.transform(
-                test_features.reshape(-1, test_features.shape[-1])
-            ).reshape(test_features.shape)
             test_dataset = torch.utils.data.TensorDataset(
                 torch.from_numpy(test_features).float(),
                 torch.from_numpy(test_targets).float()
@@ -943,7 +955,7 @@ def main():
         r"C:\25degC training\03-21-17_09.38 25degC_LA92_Pan18650PF.csv",  # 原LA92训练集现在用于测试
         r"C:\25degC testing\03-21-17_00.29 25degC_UDDS_Pan18650PF.csv"   # UDDS保持不变
     ])
-    parser.add_argument('--result_dir', type=str, default='true_sota_25degC_LA92_test_results')
+    parser.add_argument('--result_dir', type=str, default='true_sota_25degC_LA92_test_results_step12')
     parser.add_argument('--output_features', type=str, default='SOC,SOE')
     parser.add_argument('--window_size', type=int, default=32)
     parser.add_argument('--temperature', type=float, default=25.0)
@@ -969,7 +981,8 @@ def main():
     parser.add_argument('--lr', type=float, default=0.0006)        # 平衡的学习率
     parser.add_argument('--num_workers', type=int, default=0)
     parser.add_argument('--gradient_accumulation_steps', type=int, default=2)  # 轻微的梯度累积
-    
+    parser.add_argument('--ckpt_path', type=str, default=None, help='Load model from checkpoint path') # 新增参数
+
     args = parser.parse_args()
     args.output_features = [item.strip() for item in args.output_features.split(',')]
     os.makedirs(args.result_dir, exist_ok=True)
@@ -992,7 +1005,12 @@ def main():
         datamodule = ElectrochemicalDataModule(args)
         datamodule.setup()
         
-        model = TrueSOTAElectrochemicalLightningModule(args)
+        if args.ckpt_path: # 如果提供了检查点路径，则直接从 {args.ckpt_path} 加载模型进行测试，跳过训练
+            print(f"\n🚀 检测到ckpt_path，直接从 {args.ckpt_path} 加载模型进行测试，跳过训练。")
+            model = TrueSOTAElectrochemicalLightningModule.load_from_checkpoint(checkpoint_path=args.ckpt_path, hparams=args)
+        else:
+            model = TrueSOTAElectrochemicalLightningModule(args)
+            print(f"\n🚀 开始25°C环境下训练...")
         
         # 回调函数设置
         checkpoint_callback = ModelCheckpoint(
@@ -1023,11 +1041,12 @@ def main():
             benchmark=True
         )
         
-        print(f"\n🚀 开始真正SOTA训练...")
-        trainer.fit(model, datamodule)
+        if not args.ckpt_path: # 如果没有提供检查点路径，才执行训练
+            print(f"\n🚀 开始25°C环境下训练...")
+            trainer.fit(model, datamodule)
         
-        print(f"\n📊 测试真正SOTA模型...")
-        trainer.test(model, datamodule=datamodule, ckpt_path='best')
+        print(f"\n📊 测试25°C环境下模型...")
+        trainer.test(model, datamodule=datamodule, ckpt_path=args.ckpt_path if args.ckpt_path else 'best')
         
         print(f"\n✅ 真正SOTA训练完成！")
         print(f"📁 结果保存在: {args.result_dir}")
