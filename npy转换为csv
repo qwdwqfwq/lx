@@ -1,0 +1,59 @@
+# -*- coding: utf-8 -*-
+import numpy as np
+import pandas as pd
+import os
+
+# 定义原始 .npy 文件的根目录和文件名模式
+base_dir = r'C:\Users\黎枭\Desktop\旧电脑数据\基于KAN、KAN卷积的回归预测合集\=KAN+Transfomer时间序列预测\examples\ablation_A4_1_independent_MinMaxScaler_results'
+model_prefix = "Independent_46feat" # 文件名前缀
+raw_predictions_subdir = "raw_predictions" # 子目录名称
+
+print('正在处理 LA92 数据...')
+la92_true = np.load(os.path.join(base_dir, raw_predictions_subdir, f'{model_prefix}_LA92_true.npy'))
+la92_pred = np.load(os.path.join(base_dir, raw_predictions_subdir, f'{model_prefix}_LA92_pred.npy'))
+
+la92_time_axis_path = os.path.join(base_dir, raw_predictions_subdir, f'{model_prefix}_LA92_time_axis.npy')
+if os.path.exists(la92_time_axis_path):
+    la92_time = np.load(la92_time_axis_path)
+    print("   LA92 时间轴文件已加载。")
+else:
+    print("   警告: 未找到 LA92 时间轴文件。将使用从31开始的序列索引作为时间戳。")
+    la92_time = np.arange(31, 31 + len(la92_true)) # 使用从31开始的索引作为时间戳
+
+df_la92 = pd.DataFrame({
+    'Times': la92_time,
+    'SOC_TRUE': la92_true[:, 0],
+    'SOC_Pred': la92_pred[:, 0],
+    'SOE_TRUE': la92_true[:, 1],
+    'SOE_Pred': la92_pred[:, 1]
+})
+
+la92_output_path = os.path.join(base_dir, raw_predictions_subdir, "LA92_predictions.csv")
+df_la92.to_csv(la92_output_path, index=False)
+print(f"LA92 的预测数据已保存到: {la92_output_path}")
+
+print('\n正在处理 UDDS 数据...')
+udds_true = np.load(os.path.join(base_dir, raw_predictions_subdir, f'{model_prefix}_UDDS_true.npy'))
+udds_pred = np.load(os.path.join(base_dir, raw_predictions_subdir, f'{model_prefix}_UDDS_pred.npy'))
+
+udds_time_axis_path = os.path.join(base_dir, raw_predictions_subdir, f'{model_prefix}_UDDS_time_axis.npy')
+if os.path.exists(udds_time_axis_path):
+    udds_time = np.load(udds_time_axis_path)
+    print("   UDDS 时间轴文件已加载。")
+else:
+    print("   警告: 未找到 UDDS 时间轴文件。将使用从31开始的序列索引作为时间戳。")
+    udds_time = np.arange(31, 31 + len(udds_true)) # 使用从31开始的索引作为时间戳
+
+df_udds = pd.DataFrame({
+    'Times': udds_time,
+    'SOC_TRUE': udds_true[:, 0],
+    'SOC_Pred': udds_pred[:, 0],
+    'SOE_TRUE': udds_true[:, 1],
+    'SOE_Pred': udds_pred[:, 1]
+})
+
+udds_output_path = os.path.join(base_dir, raw_predictions_subdir, "UDDS_predictions.csv")
+df_udds.to_csv(udds_output_path, index=False)
+print(f"UDDS 的预测数据已保存到: {udds_output_path}")
+
+print("所有数据处理完成。")
