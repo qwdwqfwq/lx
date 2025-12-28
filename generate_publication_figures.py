@@ -1,6 +1,7 @@
 import argparse
 import os
 import gc
+import time
 import numpy as np
 import pandas as pd
 import torch
@@ -43,7 +44,7 @@ def setup_sci_style():
 
 # 定义模型颜色映射 (SCI 绘图要求)
 model_colors_map = {
-    "EKAN-T": '#0072BD',  # Deep Blue
+    "FE-KAN-T": '#0072BD',  # Deep Blue
     "No Workload Detector": '#800080',  # Purple
     "Only V-I Features": '#FF7F0E', # Orange
     "KAN": '#2CA02C',  # Green
@@ -98,7 +99,7 @@ setup_sci_style()
 
 # --- 模型配置 (更新为直接的CSV路径) ---
 MODELS_CONFIG = {
-    "EKAN-T": {
+    "FE-KAN-T": {
         "LA92_csv": r"C:\Users\黎枭\Desktop\实验数据\LA92_predictions.csv",
         "UDDS_csv": r"C:\Users\黎枭\Desktop\实验数据\UDDS_predictions.csv",
     },
@@ -134,7 +135,7 @@ MODELS_CONFIG = {
 
 def main():
     parser = argparse.ArgumentParser(description='Generate Comparison Plots for SOC/SOE Prediction')
-    parser.add_argument('--output_dir', type=str, default='comparison_plots', help='Directory to save generated plots')
+    parser.add_argument('--output_dir', type=str, default=f'publication_figures_output_{time.strftime("%Y%m%d_%H%M%S")}', help='Directory to save generated plots')
     args = parser.parse_args()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -194,7 +195,7 @@ def main():
         "BiGRU": 2.312,
         "Informer": 2.664,
         "TabPFN": 1.625,
-        "EKAN-T": 1.417
+        "FE-KAN-T": 1.417
     }
 
     user_provided_avg_mae = {
@@ -205,7 +206,7 @@ def main():
         "BiGRU": 1.792,
         "Informer": 2.144,
         "TabPFN": 1.286,
-        "EKAN-T": 1.166
+        "FE-KAN-T": 1.166
     }
 
     # --- 1. 生成时间序列对比图 ---
@@ -244,22 +245,22 @@ def main():
 
     for dataset_type in datasets_to_plot:
         # 确保 EKAN-T 数据已加载 (作为真实值基准)
-        if f"EKAN-T_{dataset_type}" not in all_loaded_data:
+        if f"FE-KAN-T_{dataset_type}" not in all_loaded_data:
             print(f"Warning: EKAN-T {dataset_type} data not found, skipping plots for {dataset_type} in combined figure.")
             continue # Skip this dataset if EKAN-T data is missing
 
-        ekant_data = all_loaded_data[f"EKAN-T_{dataset_type}"]
-        ekant_times = ekant_data['Times']
-        actual_data_len = len(ekant_times)
+        fe_kan_t_data = all_loaded_data[f"FE-KAN-T_{dataset_type}"]
+        fe_kan_t_times = fe_kan_t_data['Times']
+        actual_data_len = len(fe_kan_t_times)
 
         for metric_prefix, pred_title, err_ylabel, pred_ylabel in metrics_to_plot:
             current_ax_pred = axes[f'{dataset_type}_{metric_prefix}_Pred']
             current_ax_err = axes[f'{dataset_type}_{metric_prefix}_Error']
 
-            ekant_true_metric = ekant_data[f'{metric_prefix}_TRUE']
+            fe_kan_t_true_metric = fe_kan_t_data[f'{metric_prefix}_TRUE']
 
             # --- 绘制预测图 ---
-            current_ax_pred.plot(ekant_times, ekant_true_metric, color='black', linewidth=1.8, label='Actual Value', alpha=0.8) # 统一实际值线宽
+            current_ax_pred.plot(fe_kan_t_times, fe_kan_t_true_metric, color='black', linewidth=1.8, label='Actual Value', alpha=0.8) # 统一实际值线宽
 
             for model_name in selected_models_for_ts_plot:
                 model_plot_color = model_colors_map.get(model_name, 'gray') # 从颜色映射中获取颜色
@@ -323,12 +324,12 @@ def main():
                 y_max_zoom = 0
                 y_range_zoom = 1 
 
-                true_zoom_segment = ekant_data[f'{metric_prefix}_TRUE'][(ekant_times >= zoom_start) & (ekant_times <= zoom_end)]
+                true_zoom_segment = fe_kan_t_data[f'{metric_prefix}_TRUE'][(fe_kan_t_times >= zoom_start) & (fe_kan_t_times <= zoom_end)]
                 if len(true_zoom_segment) > 0:
                     y_min_zoom = min(y_min_zoom, np.min(true_zoom_segment))
                     y_max_zoom = max(y_max_zoom, np.max(true_zoom_segment))
 
-                axins.plot(ekant_times[(ekant_times >= zoom_start) & (ekant_times <= zoom_end)], 
+                axins.plot(fe_kan_t_times[(fe_kan_t_times >= zoom_start) & (fe_kan_t_times <= zoom_end)], 
                            true_zoom_segment, color='black', linewidth=1.8, label='Actual Value', alpha=0.8)
                 
                 for model_name in selected_models_for_ts_plot:
@@ -374,7 +375,7 @@ def main():
     print("📊 Generating RMSE and MAE comparison bar chart...")
     
     # 用户提供的所有模型及其分工况的RMSE和MAE数据
-    model_names_ordered = ["N-BEATS", "CNN-GRU", "LSTM", "TCN-LSTM", "BiGRU", "Informer", "TabPFN", "EKAN-T"]
+    model_names_ordered = ["N-BEATS", "CNN-GRU", "LSTM", "TCN-LSTM", "BiGRU", "Informer", "TabPFN", "FE-KAN-T"]
     
     # 注意：这里的数据顺序必须与model_names_ordered一致
     la92_rmses = [1.9865, 1.734, 2.024, 2.066, 2.065, 2.155, 2.193, 1.547]
@@ -403,9 +404,9 @@ def main():
     # RMSE 柱状图
     ax_rmse = axes[0]
     # 对模型按计算出的平均RMSE排序，并将EKAN-T放在最前面
-    other_models_for_sort = [m for m in model_names_ordered if m != "EKAN-T"]
+    other_models_for_sort = [m for m in model_names_ordered if m != "FE-KAN-T"]
     sorted_other_models = sorted(other_models_for_sort, key=lambda x: results_df_for_plot[results_df_for_plot['Model']==x]['Average_RMSE'].iloc[0])
-    sorted_models = ["EKAN-T"] + sorted_other_models
+    sorted_models = ["FE-KAN-T"] + sorted_other_models
 
     bar_width = 0.35
     index = np.arange(len(sorted_models))
